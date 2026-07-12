@@ -1,0 +1,9 @@
+{
+  "tickers": [
+    "^NSEI",
+    "^NSEBANK",
+    "RELIANCE.NS",
+    "TCS.NS"
+  ],
+  "intervals": ["1d"]
+}

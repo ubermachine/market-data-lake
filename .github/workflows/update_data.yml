@@ -1,0 +1,43 @@
+name: Daily Market Data Update
+
+on:
+  schedule:
+    # Runs at 16:30 UTC (10:00 PM IST) daily, after market close
+    - cron: '30 16 * * *'
+  workflow_dispatch: # Allows manual trigger from the Actions tab
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-level: '3.10'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install yfinance pandas pyarrow pytest
+
+    - name: Run Unit Tests
+      run: |
+        python -m pytest tests/
+
+    - name: Run Data Ingestion
+      run: |
+        python update_data.py
+
+    - name: Commit and Push Changes
+      run: |
+        git config --global user.name 'GitHub Actions Bot'
+        git config --global user.email 'actions@github.com'
+        git add data/*.parquet
+        # Only commit if there are changes to avoid workflow failures
+        git diff-index --quiet HEAD || git commit -m "Automated daily market data update"
+        git push
