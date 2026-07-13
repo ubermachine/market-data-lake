@@ -121,11 +121,21 @@ if __name__ == "__main__":
             
             for ticker in tickers:
                 try:
+                    df = pd.DataFrame()
                     if isinstance(bulk_df.columns, pd.MultiIndex):
                         if ticker in bulk_df.columns.levels[0]:
                             df = bulk_df[ticker].dropna(how='all').reset_index()
                         else:
-                            continue
+                            # Fallback: download individually with 5y period
+                            print(f"Ticker {ticker} missing from batch. Retrying with period='5y'...")
+                            try:
+                                df_retry = yf.download(ticker, interval="1d", period="5y", progress=False)
+                                if not df_retry.empty:
+                                    if isinstance(df_retry.columns, pd.MultiIndex):
+                                        df_retry.columns = df_retry.columns.get_level_values(0)
+                                    df = df_retry.dropna(how='all').reset_index()
+                            except Exception as re:
+                                print(f"Retry failed for {ticker}: {re}")
                     else:
                         df = bulk_df.dropna(how='all').reset_index()
                         
