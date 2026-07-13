@@ -1,7 +1,16 @@
 import os
 import json
 import pandas as pd
+import numpy as np
 import yfinance as yf
+
+# Sector indices to be separated into SectorDailyBars.parquet
+SECTOR_TICKERS = [
+    "^NSEI", "^NSEBANK", "^CNXAUTO", "^CNXIT", "^CNXPHARMA", 
+    "^CNXMETAL", "^CNXENERGY", "^CNXFMCG", "^CNXMEDIA", "^CNXREALTY", 
+    "^CNXPSUBANK", "^CNXINFRA", "NIFTY_FIN_SERVICE.NS", 
+    "NIFTY_OIL_AND_GAS.NS", "^CNXCONSUM"
+]
 
 def load_config(config_path: str) -> tuple[list[str], list[str]]:
     """Loads tickers and intervals from the json configuration file."""
@@ -9,63 +18,9 @@ def load_config(config_path: str) -> tuple[list[str], list[str]]:
         config = json.load(f)
     return config.get("tickers", []), config.get("intervals", [])
 
-def download_symbol_data(symbol: str, interval: str, period: str = "max") -> pd.DataFrame:
-    """Downloads historical OHLCV data from Yahoo Finance for a symbol and interval."""
-    # yfinance uses '1wk' for weekly and '1mo' for monthly, map them if needed
-    yf_interval = interval
-    if interval == '1w':
-        yf_interval = '1wk'
-    elif interval == '1m':
-        yf_interval = '1mo'
-        
-    df = yf.download(symbol, interval=yf_interval, period=period, progress=False)
-    if df.empty:
-        raise ValueError(f"No data downloaded for symbol: {symbol}")
-        
-    # Flatten MultiIndex columns if present (common in newer yfinance versions)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-        
-    df = df.reset_index()
-    
-    # Rename columns to standard schema
-    rename_map = {}
-    for col in df.columns:
-        col_lower = str(col).lower()
-        if col_lower == 'date' or col_lower == 'datetime':
-            rename_map[col] = 'Date'
-        elif col_lower == 'open':
-            rename_map[col] = 'Open'
-        elif col_lower == 'high':
-            rename_map[col] = 'High'
-        elif col_lower == 'low':
-            rename_map[col] = 'Low'
-        elif col_lower == 'close':
-            rename_map[col] = 'Close'
-        elif col_lower == 'volume':
-            rename_map[col] = 'Volume'
-            
-    df = df.rename(columns=rename_map)
-    
-    # Keep only the standard OHLCV columns
-    expected_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    # Ensure they exist in df
-    for col in expected_cols:
-        if col not in df.columns:
-            # Create dummy or raise
-            df[col] = None
-            
-    df = df[expected_cols]
-    
-    # Ensure Date is simple date (no timezone or time if daily/weekly/monthly)
-    df['Date'] = pd.to_datetime(df['Date']).dt.date
-    
-    return df
-
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     """Cleans gaps by forward-filling at most 2 consecutive days and dropping remaining NaNs."""
     df = df.copy()
-    # Sort by date
     df = df.sort_values('Date').reset_index(drop=True)
     
     # Forward fill up to 2 days
@@ -77,43 +32,93 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     return df
 
-def save_to_parquet(df: pd.DataFrame, symbol: str, interval: str, output_dir: str) -> str:
-    """Saves the DataFrame to a Parquet file named {symbol}_{interval}.parquet."""
-    os.makedirs(output_dir, exist_ok=True)
-    # Sanitize symbol for filename
-    safe_symbol = symbol.replace("^", "").replace(".", "_").lower()
-    filename = f"{safe_symbol}_{interval}.parquet"
-    filepath = os.path.join(output_dir, filename)
+def resample_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
+    """Resamples daily OHLCV data into weekly bars."""
+    if df_daily.empty:
+        return pd.DataFrame()
+    df = df_daily.copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values('Date')
     
+    resampled_list = []
+    for ticker, group in df.groupby('Ticker'):
+        group_idx = group.set_index('Date')
+        weekly = group_idx.resample('W-FRI').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna(subset=['Close'])
+        weekly = weekly.reset_index()
+        weekly['Ticker'] = ticker
+        resampled_list.append(weekly)
+        
+    if not resampled_list:
+        return pd.DataFrame()
+        
+    resampled_df = pd.concat(resampled_list, ignore_index=True)
+    # Match schema column order: Ticker first
+    resampled_df = resampled_df[['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+    return resampled_df
+
+# For backward compatibility test support
+def download_symbol_data(symbol: str, interval: str, period: str = "max") -> pd.DataFrame:
+    """Downloads daily data for a single ticker (kept for compatibility in tests)."""
+    df = yf.download(symbol, interval=interval, period=period, progress=False)
+    if df.empty:
+        raise ValueError(f"No data for: {symbol}")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
+    rename_map = {'datetime': 'Date', 'index': 'Date'}
+    for col in df.columns:
+        if str(col).lower() == 'date':
+            rename_map[col] = 'Date'
+        elif str(col).lower() in ['open', 'high', 'low', 'close', 'volume']:
+            rename_map[col] = str(col).capitalize()
+    df = df.rename(columns=rename_map)
+    expected_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = None
+    df = df[expected_cols]
+    df['Date'] = pd.to_datetime(df['Date']).dt.date
+    return df
+
+def save_to_parquet(df: pd.DataFrame, symbol: str, interval: str, output_dir: str) -> str:
+    """Saves a dataframe to individual parquet (kept for backward compatibility tests)."""
+    os.makedirs(output_dir, exist_ok=True)
+    safe_symbol = symbol.replace("^", "").replace(".", "_").lower()
+    filepath = os.path.join(output_dir, f"{safe_symbol}_{interval}.parquet")
     df_to_save = df.copy()
-    # Convert date to timestamp for Parquet compatibility
     df_to_save['Date'] = pd.to_datetime(df_to_save['Date'])
     df_to_save.to_parquet(filepath, index=False, engine='pyarrow')
     return filepath
 
+
 if __name__ == "__main__":
-    # If run directly, read config, download all, and save to a 'data' folder
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, "tickers.json")
     output_dir = os.path.join(base_dir, "data")
+    os.makedirs(output_dir, exist_ok=True)
     
     try:
         tickers, intervals = load_config(config_path)
-        for interval in intervals:
-            print(f"Downloading {len(tickers)} tickers in batch for interval {interval}...")
-            yf_interval = interval
-            if interval == '1w':
-                yf_interval = '1wk'
-            elif interval == '1m':
-                yf_interval = '1mo'
-                
-            try:
-                # Batch download all tickers at once
-                bulk_df = yf.download(tickers, interval=yf_interval, period="max", group_by='ticker', progress=False)
-            except Exception as e:
-                print(f"Bulk download failed: {e}")
-                continue
-                
+        # We only ingest '1d' daily data because weekly and metadata are compiled from it
+        print(f"Downloading {len(tickers)} tickers in batch...")
+        
+        try:
+            bulk_df = yf.download(tickers, interval="1d", period="max", group_by='ticker', progress=False)
+        except Exception as e:
+            print(f"Bulk download failed: {e}")
+            bulk_df = None
+            
+        if bulk_df is not None:
+            stock_data_list = []
+            sector_data_list = []
+            stock_tickers_processed = []
+            
             for ticker in tickers:
                 try:
                     if isinstance(bulk_df.columns, pd.MultiIndex):
@@ -122,7 +127,6 @@ if __name__ == "__main__":
                         else:
                             continue
                     else:
-                        # Fallback for single ticker query or non-MultiIndex output
                         df = bulk_df.dropna(how='all').reset_index()
                         
                     if df.empty:
@@ -146,7 +150,6 @@ if __name__ == "__main__":
                             rename_map[col] = 'Volume'
                             
                     df = df.rename(columns=rename_map)
-                    
                     expected_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
                     for col in expected_cols:
                         if col not in df.columns:
@@ -154,11 +157,60 @@ if __name__ == "__main__":
                             
                     df = df[expected_cols]
                     df['Date'] = pd.to_datetime(df['Date']).dt.date
-                    
                     df_cleaned = preprocess_data(df)
-                    path = save_to_parquet(df_cleaned, ticker, interval, output_dir)
+                    
+                    if df_cleaned.empty:
+                        continue
+                        
+                    # Append Ticker column
+                    df_cleaned['Ticker'] = ticker
+                    # Reorder columns
+                    df_cleaned = df_cleaned[['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+                    
+                    if ticker in SECTOR_TICKERS:
+                        sector_data_list.append(df_cleaned)
+                    else:
+                        stock_data_list.append(df_cleaned)
+                        stock_tickers_processed.append(ticker)
                 except Exception as e:
                     print(f"Error processing {ticker}: {e}")
-            print(f"Finished processing all tickers for interval {interval}")
+            
+            # 1. Compile SectorDailyBars.parquet
+            if sector_data_list:
+                df_sector = pd.concat(sector_data_list, ignore_index=True)
+                df_sector['Date'] = pd.to_datetime(df_sector['Date'])
+                df_sector = df_sector.sort_values(['Ticker', 'Date']).reset_index(drop=True)
+                sector_path = os.path.join(output_dir, "SectorDailyBars.parquet")
+                df_sector.to_parquet(sector_path, index=False, engine='pyarrow')
+                print(f"Saved consolidated SectorDailyBars.parquet with {len(df_sector)} rows.")
+            
+            # 2. Compile DailyBars.parquet
+            if stock_data_list:
+                df_stock_daily = pd.concat(stock_data_list, ignore_index=True)
+                df_stock_daily['Date'] = pd.to_datetime(df_stock_daily['Date'])
+                df_stock_daily = df_stock_daily.sort_values(['Ticker', 'Date']).reset_index(drop=True)
+                daily_path = os.path.join(output_dir, "DailyBars.parquet")
+                df_stock_daily.to_parquet(daily_path, index=False, engine='pyarrow')
+                print(f"Saved consolidated DailyBars.parquet with {len(df_stock_daily)} rows.")
+                
+                # 3. Compile WeeklyBars.parquet
+                df_stock_weekly = resample_weekly(df_stock_daily)
+                if not df_stock_weekly.empty:
+                    df_stock_weekly = df_stock_weekly.sort_values(['Ticker', 'Date']).reset_index(drop=True)
+                    weekly_path = os.path.join(output_dir, "WeeklyBars.parquet")
+                    df_stock_weekly.to_parquet(weekly_path, index=False, engine='pyarrow')
+                    print(f"Saved consolidated WeeklyBars.parquet with {len(df_stock_weekly)} rows.")
+            
+            # 4. Compile StockMetadatas.parquet
+            if stock_tickers_processed:
+                metadata_rows = []
+                for st_ticker in sorted(stock_tickers_processed):
+                    name = st_ticker.replace(".NS", "")
+                    metadata_rows.append({"Ticker": st_ticker, "Name": name, "Sector": "NSE"})
+                df_meta = pd.DataFrame(metadata_rows)
+                meta_path = os.path.join(output_dir, "StockMetadatas.parquet")
+                df_meta.to_parquet(meta_path, index=False, engine='pyarrow')
+                print(f"Saved consolidated StockMetadatas.parquet with {len(df_meta)} rows.")
+                
     except Exception as e:
         print(f"Failed to run data ingestion: {e}")
