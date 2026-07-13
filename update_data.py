@@ -100,14 +100,65 @@ if __name__ == "__main__":
     try:
         tickers, intervals = load_config(config_path)
         for interval in intervals:
+            print(f"Downloading {len(tickers)} tickers in batch for interval {interval}...")
+            yf_interval = interval
+            if interval == '1w':
+                yf_interval = '1wk'
+            elif interval == '1m':
+                yf_interval = '1mo'
+                
+            try:
+                # Batch download all tickers at once
+                bulk_df = yf.download(tickers, interval=yf_interval, period="max", group_by='ticker', progress=False)
+            except Exception as e:
+                print(f"Bulk download failed: {e}")
+                continue
+                
             for ticker in tickers:
-                print(f"Downloading {ticker} ({interval})...")
                 try:
-                    df = download_symbol_data(ticker, interval)
+                    if isinstance(bulk_df.columns, pd.MultiIndex):
+                        if ticker in bulk_df.columns.levels[0]:
+                            df = bulk_df[ticker].dropna(how='all').reset_index()
+                        else:
+                            continue
+                    else:
+                        # Fallback for single ticker query or non-MultiIndex output
+                        df = bulk_df.dropna(how='all').reset_index()
+                        
+                    if df.empty:
+                        continue
+                        
+                    # Standardize columns
+                    rename_map = {}
+                    for col in df.columns:
+                        col_lower = str(col).lower()
+                        if col_lower in ['date', 'datetime', 'index']:
+                            rename_map[col] = 'Date'
+                        elif col_lower == 'open':
+                            rename_map[col] = 'Open'
+                        elif col_lower == 'high':
+                            rename_map[col] = 'High'
+                        elif col_lower == 'low':
+                            rename_map[col] = 'Low'
+                        elif col_lower == 'close':
+                            rename_map[col] = 'Close'
+                        elif col_lower == 'volume':
+                            rename_map[col] = 'Volume'
+                            
+                    df = df.rename(columns=rename_map)
+                    
+                    expected_cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
+                    for col in expected_cols:
+                        if col not in df.columns:
+                            df[col] = None
+                            
+                    df = df[expected_cols]
+                    df['Date'] = pd.to_datetime(df['Date']).dt.date
+                    
                     df_cleaned = preprocess_data(df)
                     path = save_to_parquet(df_cleaned, ticker, interval, output_dir)
-                    print(f"Saved to {path} ({len(df_cleaned)} rows)")
                 except Exception as e:
-                    print(f"Error downloading {ticker}: {e}")
+                    print(f"Error processing {ticker}: {e}")
+            print(f"Finished processing all tickers for interval {interval}")
     except Exception as e:
         print(f"Failed to run data ingestion: {e}")
