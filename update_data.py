@@ -32,6 +32,22 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     return df
 
+def merge_and_deduplicate(df_old: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
+    """Combines old and new bar DataFrames, deduplicating on ['Ticker', 'Date'] keeping the latest."""
+    if df_old.empty:
+        return df_new
+    if df_new.empty:
+        return df_old
+        
+    combined = pd.concat([df_old, df_new], ignore_index=True)
+    # Ensure Date is datetime64 for matching and sorting
+    combined['Date'] = pd.to_datetime(combined['Date'])
+    
+    # Deduplicate: keep the last occurrence (which is df_new)
+    combined = combined.drop_duplicates(subset=['Ticker', 'Date'], keep='last')
+    combined = combined.sort_values(['Ticker', 'Date']).reset_index(drop=True)
+    return combined
+
 def resample_weekly(df_daily: pd.DataFrame) -> pd.DataFrame:
     """Resamples daily OHLCV data into weekly bars."""
     if df_daily.empty:
@@ -105,28 +121,67 @@ if __name__ == "__main__":
     
     try:
         tickers, intervals = load_config(config_path)
-        # We only ingest '1d' daily data because weekly and metadata are compiled from it
-        print(f"Downloading {len(tickers)} tickers in batch...")
         
-        try:
-            bulk_df = yf.download(tickers, interval="1d", period="max", group_by='ticker', progress=False)
-        except Exception as e:
-            print(f"Bulk download failed: {e}")
-            bulk_df = None
-            
-        if bulk_df is not None:
-            stock_data_list = []
-            sector_data_list = []
-            stock_tickers_processed = []
-            
-            for ticker in tickers:
+        # Define consolidated output paths
+        sector_path = os.path.join(output_dir, "SectorDailyBars.parquet")
+        daily_path = os.path.join(output_dir, "DailyBars.parquet")
+        weekly_path = os.path.join(output_dir, "WeeklyBars.parquet")
+        meta_path = os.path.join(output_dir, "StockMetadatas.parquet")
+        
+        # Load existing data lake cache
+        df_sector_old = pd.DataFrame()
+        df_daily_old = pd.DataFrame()
+        
+        if os.path.exists(sector_path):
+            try:
+                df_sector_old = pd.read_parquet(sector_path)
+                df_sector_old['Date'] = pd.to_datetime(df_sector_old['Date'])
+            except Exception as e:
+                print(f"Failed to read existing SectorDailyBars.parquet: {e}")
+                
+        if os.path.exists(daily_path):
+            try:
+                df_daily_old = pd.read_parquet(daily_path)
+                df_daily_old['Date'] = pd.to_datetime(df_daily_old['Date'])
+            except Exception as e:
+                print(f"Failed to read existing DailyBars.parquet: {e}")
+                
+        # Identify incremental vs bootstrap tickers
+        cached_sector_tickers = set(df_sector_old['Ticker'].unique()) if not df_sector_old.empty else set()
+        cached_stock_tickers = set(df_daily_old['Ticker'].unique()) if not df_daily_old.empty else set()
+        
+        tickers_sector_inc = [t for t in tickers if t in SECTOR_TICKERS and t in cached_sector_tickers]
+        tickers_sector_boot = [t for t in tickers if t in SECTOR_TICKERS and t not in cached_sector_tickers]
+        
+        tickers_stock_inc = [t for t in tickers if t not in SECTOR_TICKERS and t in cached_stock_tickers]
+        tickers_stock_boot = [t for t in tickers if t not in SECTOR_TICKERS and t not in cached_stock_tickers]
+        
+        # Batch download helper
+        def download_batch(ticker_list: list, period: str) -> pd.DataFrame:
+            if not ticker_list:
+                return pd.DataFrame()
+            print(f"Downloading batch of {len(ticker_list)} symbols with period='{period}'...")
+            try:
+                # yfinance download in batch
+                return yf.download(ticker_list, interval="1d", period=period, group_by='ticker', progress=False)
+            except Exception as e:
+                print(f"Batch download failed for period '{period}': {e}")
+                return pd.DataFrame()
+                
+        # Batch processing helper
+        def process_batch(bulk_df: pd.DataFrame, ticker_list: list) -> list[pd.DataFrame]:
+            rows_list = []
+            if bulk_df is None or bulk_df.empty:
+                return rows_list
+                
+            for ticker in ticker_list:
                 try:
                     df = pd.DataFrame()
                     if isinstance(bulk_df.columns, pd.MultiIndex):
                         if ticker in bulk_df.columns.levels[0]:
                             df = bulk_df[ticker].dropna(how='all').reset_index()
                         else:
-                            # Fallback: download individually with 5y period
+                            # Retry individually with period='5y' if missing from batch
                             print(f"Ticker {ticker} missing from batch. Retrying with period='5y'...")
                             try:
                                 df_retry = yf.download(ticker, interval="1d", period="5y", progress=False)
@@ -172,55 +227,68 @@ if __name__ == "__main__":
                     if df_cleaned.empty:
                         continue
                         
-                    # Append Ticker column
                     df_cleaned['Ticker'] = ticker
-                    # Reorder columns
                     df_cleaned = df_cleaned[['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
-                    
-                    if ticker in SECTOR_TICKERS:
-                        sector_data_list.append(df_cleaned)
-                    else:
-                        stock_data_list.append(df_cleaned)
-                        stock_tickers_processed.append(ticker)
+                    rows_list.append(df_cleaned)
                 except Exception as e:
                     print(f"Error processing {ticker}: {e}")
+            return rows_list
+
+        # Execute Ingestion Batches
+        sec_inc_rows = process_batch(download_batch(tickers_sector_inc, "7d"), tickers_sector_inc)
+        sec_boot_rows = process_batch(download_batch(tickers_sector_boot, "max"), tickers_sector_boot)
+        
+        stk_inc_rows = process_batch(download_batch(tickers_stock_inc, "7d"), tickers_stock_inc)
+        stk_boot_rows = process_batch(download_batch(tickers_stock_boot, "max"), tickers_stock_boot)
+        
+        cutoff_date = pd.Timestamp.now() - pd.DateOffset(years=3)
+        
+        # Combine and compile Sector data
+        new_sector_df = pd.DataFrame()
+        all_sec_rows = sec_inc_rows + sec_boot_rows
+        if all_sec_rows:
+            new_sector_df = pd.concat(all_sec_rows, ignore_index=True)
             
-            # 1. Compile SectorDailyBars.parquet
-            if sector_data_list:
-                df_sector = pd.concat(sector_data_list, ignore_index=True)
-                df_sector['Date'] = pd.to_datetime(df_sector['Date'])
-                df_sector = df_sector.sort_values(['Ticker', 'Date']).reset_index(drop=True)
-                sector_path = os.path.join(output_dir, "SectorDailyBars.parquet")
-                df_sector.to_parquet(sector_path, index=False, engine='pyarrow')
-                print(f"Saved consolidated SectorDailyBars.parquet with {len(df_sector)} rows.")
+        df_sector_final = merge_and_deduplicate(df_sector_old, new_sector_df)
+        if not df_sector_final.empty:
+            df_sector_final['Date_dt'] = pd.to_datetime(df_sector_final['Date'])
+            df_sector_final = df_sector_final[df_sector_final['Date_dt'] >= cutoff_date].copy()
+            df_sector_final = df_sector_final.drop(columns=['Date_dt'])
+            df_sector_final.to_parquet(sector_path, index=False, engine='pyarrow', compression='zstd')
+            print(f"Saved consolidated SectorDailyBars.parquet with {len(df_sector_final)} rows.")
             
-            # 2. Compile DailyBars.parquet
-            if stock_data_list:
-                df_stock_daily = pd.concat(stock_data_list, ignore_index=True)
-                df_stock_daily['Date'] = pd.to_datetime(df_stock_daily['Date'])
-                df_stock_daily = df_stock_daily.sort_values(['Ticker', 'Date']).reset_index(drop=True)
-                daily_path = os.path.join(output_dir, "DailyBars.parquet")
-                df_stock_daily.to_parquet(daily_path, index=False, engine='pyarrow')
-                print(f"Saved consolidated DailyBars.parquet with {len(df_stock_daily)} rows.")
+        # Combine and compile Stock data
+        new_stock_df = pd.DataFrame()
+        all_stk_rows = stk_inc_rows + stk_boot_rows
+        if all_stk_rows:
+            new_stock_df = pd.concat(all_stk_rows, ignore_index=True)
+            
+        df_stock_final = merge_and_deduplicate(df_daily_old, new_stock_df)
+        if not df_stock_final.empty:
+            df_stock_final['Date_dt'] = pd.to_datetime(df_stock_final['Date'])
+            df_stock_final = df_stock_final[df_stock_final['Date_dt'] >= cutoff_date].copy()
+            df_stock_final = df_stock_final.drop(columns=['Date_dt'])
+            
+            df_stock_final.to_parquet(daily_path, index=False, engine='pyarrow', compression='zstd')
+            print(f"Saved consolidated DailyBars.parquet with {len(df_stock_final)} rows.")
+            
+            # Resample weekly
+            df_weekly = resample_weekly(df_stock_final)
+            if not df_weekly.empty:
+                df_weekly = df_weekly.sort_values(['Ticker', 'Date']).reset_index(drop=True)
+                df_weekly.to_parquet(weekly_path, index=False, engine='pyarrow', compression='zstd')
+                print(f"Saved consolidated WeeklyBars.parquet with {len(df_weekly)} rows.")
                 
-                # 3. Compile WeeklyBars.parquet
-                df_stock_weekly = resample_weekly(df_stock_daily)
-                if not df_stock_weekly.empty:
-                    df_stock_weekly = df_stock_weekly.sort_values(['Ticker', 'Date']).reset_index(drop=True)
-                    weekly_path = os.path.join(output_dir, "WeeklyBars.parquet")
-                    df_stock_weekly.to_parquet(weekly_path, index=False, engine='pyarrow')
-                    print(f"Saved consolidated WeeklyBars.parquet with {len(df_stock_weekly)} rows.")
+        # Regenerate stock metadata
+        active_tickers = sorted(list(df_stock_final['Ticker'].unique())) if not df_stock_final.empty else []
+        if active_tickers:
+            metadata_rows = []
+            for st_ticker in active_tickers:
+                name = st_ticker.replace(".NS", "")
+                metadata_rows.append({"Ticker": st_ticker, "Name": name, "Sector": "NSE"})
+            df_meta = pd.DataFrame(metadata_rows)
+            df_meta.to_parquet(meta_path, index=False, engine='pyarrow', compression='zstd')
+            print(f"Saved consolidated StockMetadatas.parquet with {len(df_meta)} rows.")
             
-            # 4. Compile StockMetadatas.parquet
-            if stock_tickers_processed:
-                metadata_rows = []
-                for st_ticker in sorted(stock_tickers_processed):
-                    name = st_ticker.replace(".NS", "")
-                    metadata_rows.append({"Ticker": st_ticker, "Name": name, "Sector": "NSE"})
-                df_meta = pd.DataFrame(metadata_rows)
-                meta_path = os.path.join(output_dir, "StockMetadatas.parquet")
-                df_meta.to_parquet(meta_path, index=False, engine='pyarrow')
-                print(f"Saved consolidated StockMetadatas.parquet with {len(df_meta)} rows.")
-                
     except Exception as e:
         print(f"Failed to run data ingestion: {e}")
