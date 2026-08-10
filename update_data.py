@@ -9,7 +9,7 @@ SECTOR_TICKERS = [
     "^NSEI", "^NSEBANK", "^CNXAUTO", "^CNXIT", "^CNXPHARMA", 
     "^CNXMETAL", "^CNXENERGY", "^CNXFMCG", "^CNXMEDIA", "^CNXREALTY", 
     "^CNXPSUBANK", "^CNXINFRA", "NIFTY_FIN_SERVICE.NS", 
-    "NIFTY_OIL_AND_GAS.NS", "^CNXCONSUM"
+    "NIFTY_OIL_AND_GAS.NS", "^CNXCONSUM", "^INDIAVIX"
 ]
 
 def load_config(config_path: str) -> tuple[list[str], list[str]]:
